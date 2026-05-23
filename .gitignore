@@ -1,11 +1,3 @@
-# === Claude Code (local-only, never commit) ===
-.claude/
-.claude.json
-AGENTS.md
-package.json
-package-lock.json
-node_modules/
-
 # === Python ===
 __pycache__/
 *.pyc
