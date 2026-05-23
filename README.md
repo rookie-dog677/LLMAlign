@@ -1,13 +1,8 @@
-# LLMAlign: Two-Stage Dual-View Contrastive Alignment of LLM Item Embeddings for Sequential Recommendation
+# LLMAlign: Making Large Language Models Effective Embedding Models for Sequential Recommendation
 
 ## Introduction
 
-LLMAlign is a two-stage contrastive framework that distils a pre-trained LLM into a dual-view item encoder for sequential recommendation.
-
-- **Stage 1 — CPA (Contrastive Preference Alignment):** user–item InfoNCE with a Latent Attention Pooling head.
-- **Stage 2 — TCL (Temporal/Co-occurrence Contrastive Learning):** item–item InfoNCE on PPMI-weighted pairs over a frozen Stage 1.
-
-The two heads are concatenated (`2 × hidden_size`) and fed into a downstream recommender (SASRec / BERT4Rec / SR-GNN) via a MoE adapter.
+This is the implementation of the submission "LLMAlign: Making Large Language Models Effective Embedding Models for Sequential Recommendation".
 
 ## Environments
 
@@ -35,8 +30,6 @@ BASE_MODEL=/path/to/local/Qwen2-0.5B LLMALIGN_DATASET=Games_5core bash run_LLMAl
 # Stage 2: Temporal/Co-occurrence Contrastive Learning
 LLMALIGN_DATASET=Games_5core bash run_LLMAlign_TCL
 ```
-
-`run_LLMAlign_TCL` auto-discovers the latest Stage 1 checkpoint under `output/`; override with `BASE_MODEL=...` if needed. Tunable hyperparameters are documented at the top of each wrapper script.
 
 ## Evaluation
 
