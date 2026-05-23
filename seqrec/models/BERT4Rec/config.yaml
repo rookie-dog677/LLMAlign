@@ -1,0 +1,21 @@
+loss_type: ce
+optimizer: adam
+
+hidden_size: 128
+layer_num: 2
+num_heads: 2
+dropout: 0.3
+mask_ratio: 0.2
+embedding_layer_norm: False
+
+torch_compile: True
+torch_compile_mode: default
+
+adapter_dims: [-1]  # must ending with -1, which refers to hidden_size
+item_adapter_type: linear  # linear | moe
+moe_n_exps: 8
+moe_dropout: 0.0
+moe_noise: False
+moe_top_k: 2
+moe_temperature: 1.0
+moe_balance_weight: 1.0e-3

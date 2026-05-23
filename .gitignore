@@ -1,0 +1,65 @@
+# === Claude Code (local-only, never commit) ===
+.claude/
+.claude.json
+package.json
+package-lock.json
+node_modules/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# === Training artifacts ===
+seqrec/ckpt/
+output/
+item_info/
+logs/
+wandb/
+runs/
+Results/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.safetensors
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Editor / IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.ipynb_checkpoints/
+
+# === Python virtual envs ===
+venv/
+.venv/
+env/
+
+# === Secrets / local environment ===
+.env
+.env.*
+!.env.example
+
+# === Large data (provide separately) ===
+# Raw Amazon Review CSVs are License-restricted; users must download them
+# from https://amazon-reviews-2023.github.io/ themselves.
+data/
+data/**/*.csv
+data/**/raw/
+data/**/train/
+data/**/test/
+data/**/valid/

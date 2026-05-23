@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${SCRIPT_DIR}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+
+if [ ! -x "${PYTHON_BIN}" ]; then
+    PYTHON_BIN="$(command -v python3 || command -v python)"
+fi
+
+# ── Dataset helpers (shared with run_LLMAlign_TCL) ──────────────────────────
+
+map_to_raw_dataset() {
+    case "$1" in
+        Games_5core|Video_Games) printf '%s' "Video_Games" ;;
+        Arts_5core|Arts_Crafts_and_Sewing) printf '%s' "Arts_Crafts_and_Sewing" ;;
+        Baby_5core|Baby_Products) printf '%s' "Baby_Products" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+find_dataset_csv() {
+    local raw_dataset="$1"
+    local split="$2"
+    local dataset_dir="${DATA_ROOT}/${raw_dataset}/5-core/${split}"
+    local csv_path=""
+
+    if [ ! -d "${dataset_dir}" ]; then
+        return 1
+    fi
+
+    csv_path="$(find "${dataset_dir}" -maxdepth 1 -type f -name "${raw_dataset}*.csv" ! -name '*.filtered_hard_overlap.csv' | sort | head -n 1)"
+    if [ -z "${csv_path}" ]; then
+        csv_path="$(find "${dataset_dir}" -maxdepth 1 -type f -name "${raw_dataset}*.csv" | sort | head -n 1)"
+    fi
+    if [ -z "${csv_path}" ]; then
+        return 1
+    fi
+    printf '%s' "${csv_path}"
+}
+
+resolve_single_token_anchor() {
+    local model_path="$1"
+    local detected_anchor=""
+    detected_anchor="$("${PYTHON_BIN}" - "${model_path}" <<'PY'
+import sys
+from transformers import AutoTokenizer
+
+model_path = sys.argv[1]
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    print(tokenizer.eos_token or "")
+except Exception:
+    print("")
+PY
+)"
+    case "${detected_anchor}" in
+        "<|endoftext|>"|"<|im_end|>")
+            printf '%s' "${detected_anchor}"
+            ;;
+        *)
+            printf '%s' "<|endoftext|>"
+            ;;
+    esac
+}
+
+default_max_steps() {
+    case "$1" in
+        Video_Games|Games_5core)       printf '%s' "-1" ;;
+        Arts_Crafts_and_Sewing|Arts_5core) printf '%s' "-1" ;;
+        Baby_Products|Baby_5core)      printf '%s' "-1" ;;
+        *)                             printf '%s' "-1" ;;
+    esac
+}
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+DATASET_INPUT="${LLMALIGN_DATASET:-${DATASET:-Video_Games}}"
+RAW_DATASET="$(map_to_raw_dataset "${DATASET_INPUT}")"
+DEFAULT_MAX_STEPS="$(default_max_steps "${DATASET_INPUT}")"
+
+# Base model.
+# Open-source runs require an explicit local HuggingFace model/checkpoint path.
+# Example: BASE_MODEL=/path/to/Qwen2-0.5B bash run_LLMAlign_CPA
+BASE_MODEL="${BASE_MODEL:-${LLMALIGN_BASE_MODEL:-}}"
+
+# Data files
+TRAIN_FILE="${TRAIN_FILE:-$(find_dataset_csv "${RAW_DATASET}" train)}"
+EVAL_FILE="${EVAL_FILE:-$(find_dataset_csv "${RAW_DATASET}" valid)}"
+
+# Training hyperparameters
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+MAX_STEPS="${MAX_STEPS:-${DEFAULT_MAX_STEPS}}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-300}"
+PER_DEVICE_EVAL_BATCH_SIZE="${PER_DEVICE_EVAL_BATCH_SIZE:-300}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+WARMUP_STEPS="${WARMUP_STEPS:-200}"
+SEED="${SEED:-42}"
+
+# Contrastive settings
+ATTENTION_MASK_TYPE="${ATTENTION_MASK_TYPE:-bidirectional}"
+EMBEDDING_HEAD_TYPE="${EMBEDDING_HEAD_TYPE:-latent_attention}"
+POOLING_MODE="${POOLING_MODE:-last_token}"
+TEMPERATURE="${TEMPERATURE:-0.07}"
+LEARNABLE_TEMPERATURE="${LEARNABLE_TEMPERATURE:-True}"
+NORMALIZE_EMBEDDINGS="${NORMALIZE_EMBEDDINGS:-True}"
+
+# Contrastive loss
+CONTRASTIVE_LOSS_MODE="${CONTRASTIVE_LOSS_MODE:-multi_positive_nce}"
+POSITIVE_GROUP_BY="${POSITIVE_GROUP_BY:-item_id}"
+LOGIT_SCALE_MAX="${LOGIT_SCALE_MAX:-100.0}"
+
+# Sequence length
+MAX_USER_LEN="${MAX_USER_LEN:-256}"
+MAX_ITEM_LEN="${MAX_ITEM_LEN:-128}"
+
+# Negative sampling
+SAMPLED_NEGATIVES="${SAMPLED_NEGATIVES:-8}"
+NEGATIVE_SAMPLING_STRATEGY="${NEGATIVE_SAMPLING_STRATEGY:-hard_overlap}"
+NEGATIVE_HARD_TOPK="${NEGATIVE_HARD_TOPK:-32}"
+NEGATIVE_HARD_HISTORY_WEIGHT="${NEGATIVE_HARD_HISTORY_WEIGHT:-0.35}"
+NEGATIVE_HARD_MAX_TOKEN_DF_RATIO="${NEGATIVE_HARD_MAX_TOKEN_DF_RATIO:-0.2}"
+NEGATIVE_HARD_CANDIDATE_CAP="${NEGATIVE_HARD_CANDIDATE_CAP:-1024}"
+NEGATIVE_HARD_MIN_SHARED_TOKENS="${NEGATIVE_HARD_MIN_SHARED_TOKENS:-1}"
+NEGATIVE_HARD_LOG_STATS="${NEGATIVE_HARD_LOG_STATS:-False}"
+NEGATIVE_HARD_LOG_EVERY="${NEGATIVE_HARD_LOG_EVERY:-1}"
+NEGATIVE_AVOID_BATCH_POSITIVES="${NEGATIVE_AVOID_BATCH_POSITIVES:-True}"
+NEGATIVE_DEDUP_PER_QUERY="${NEGATIVE_DEDUP_PER_QUERY:-False}"
+NEGATIVE_MAX_TRIALS="${NEGATIVE_MAX_TRIALS:-48}"
+
+# Latent attention head
+LATENT_NUM_LATENTS="${LATENT_NUM_LATENTS:-128}"
+LATENT_NUM_CROSS_HEADS="${LATENT_NUM_CROSS_HEADS:-8}"
+LATENT_CROSS_DIM_HEAD="${LATENT_CROSS_DIM_HEAD:-64}"
+LATENT_FF_MULT="${LATENT_FF_MULT:-4}"
+
+# Eval & save
+EVAL_STEPS="${EVAL_STEPS:-50}"
+SAVE_STEPS="${SAVE_STEPS:-${EVAL_STEPS}}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
+EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-5}"
+LOGGING_STEPS="${LOGGING_STEPS:-10}"
+BF16="${BF16:-True}"
+REPORT_TO="${REPORT_TO:-none}"
+
+# ── Validation ───────────────────────────────────────────────────────────────
+
+if [ -z "${BASE_MODEL}" ]; then
+    echo "[LLMAlign-CPA] ERROR: BASE_MODEL/LLMALIGN_BASE_MODEL must be set to a local HuggingFace model/checkpoint directory." >&2
+    echo "[LLMAlign-CPA] Example: BASE_MODEL=/path/to/Qwen2-0.5B bash run_LLMAlign_CPA" >&2
+    exit 1
+fi
+if [ ! -d "${BASE_MODEL}" ]; then
+    echo "[LLMAlign-CPA] ERROR: base_model is not a local directory: ${BASE_MODEL}" >&2
+    echo "[LLMAlign-CPA] This wrapper does not resolve HuggingFace model IDs directly; download the model first or pass a local checkpoint path." >&2
+    exit 1
+fi
+if [ ! -f "${TRAIN_FILE}" ]; then
+    echo "[LLMAlign-CPA] ERROR: train file not found: ${TRAIN_FILE}" >&2
+    exit 1
+fi
+if [ ! -f "${EVAL_FILE}" ]; then
+    echo "[LLMAlign-CPA] ERROR: eval file not found: ${EVAL_FILE}" >&2
+    exit 1
+fi
+
+# Text suffix (eos anchor token). Resolve only after BASE_MODEL is validated so
+# missing local model paths fail fast without network access.
+ITEM_SUFFIX="${ITEM_SUFFIX:-$(resolve_single_token_anchor "${BASE_MODEL}")}"
+USER_SUFFIX="${USER_SUFFIX:-$(resolve_single_token_anchor "${BASE_MODEL}")}"
+
+# Output directory
+TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+RUN_TAG="${RUN_TAG:-Qwen2-0.5B-CSFT-Contrastive-${RAW_DATASET}-qwen2-bidir-latent-hardoverlap-eval${EVAL_STEPS}-es${EARLY_STOPPING_PATIENCE}-lr${LEARNING_RATE}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/${RUN_TAG}-${TIMESTAMP}}"
+
+CUDA_DEVICE="${CUDA_DEVICE:-0}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+
+mkdir -p "${REPO_ROOT}/output" "${REPO_ROOT}/logs"
+
+# ── Log configuration ────────────────────────────────────────────────────────
+
+echo "[LLMAlign-CPA] dataset=${RAW_DATASET}"
+echo "[LLMAlign-CPA] base_model=${BASE_MODEL}"
+echo "[LLMAlign-CPA] train_file=${TRAIN_FILE}"
+echo "[LLMAlign-CPA] eval_file=${EVAL_FILE}"
+echo "[LLMAlign-CPA] output_dir=${OUTPUT_DIR}"
+echo "[LLMAlign-CPA] lr=${LEARNING_RATE} max_steps=${MAX_STEPS} eval_steps=${EVAL_STEPS} es_patience=${EARLY_STOPPING_PATIENCE}"
+echo "[LLMAlign-CPA] attention_mask_type=${ATTENTION_MASK_TYPE} embedding_head=${EMBEDDING_HEAD_TYPE}"
+echo "[LLMAlign-CPA] user_suffix=${USER_SUFFIX} item_suffix=${ITEM_SUFFIX}"
+
+# ── Launch training ──────────────────────────────────────────────────────────
+
+resume_args=()
+if [ -n "${RESUME_FROM_CHECKPOINT}" ]; then
+    resume_args+=(--resume_from_checkpoint="${RESUME_FROM_CHECKPOINT}")
+fi
+
+exec env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${PYTHON_BIN}" "${REPO_ROOT}/stage1/run_llmalign_cpa.py" \
+    --base_model="${BASE_MODEL}" \
+    --train_file="${TRAIN_FILE}" \
+    --eval_file="${EVAL_FILE}" \
+    --output_dir="${OUTPUT_DIR}" \
+    --learning_rate="${LEARNING_RATE}" \
+    --max_steps="${MAX_STEPS}" \
+    --per_device_train_batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}" \
+    --per_device_eval_batch_size="${PER_DEVICE_EVAL_BATCH_SIZE}" \
+    --gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}" \
+    --weight_decay="${WEIGHT_DECAY}" \
+    --warmup_steps="${WARMUP_STEPS}" \
+    --seed="${SEED}" \
+    --attention_mask_type="${ATTENTION_MASK_TYPE}" \
+    --embedding_head_type="${EMBEDDING_HEAD_TYPE}" \
+    --pooling_mode="${POOLING_MODE}" \
+    --temperature="${TEMPERATURE}" \
+    --learnable_temperature="${LEARNABLE_TEMPERATURE}" \
+    --contrastive_loss_mode="${CONTRASTIVE_LOSS_MODE}" \
+    --positive_group_by="${POSITIVE_GROUP_BY}" \
+    --normalize_embeddings="${NORMALIZE_EMBEDDINGS}" \
+    --logit_scale_max="${LOGIT_SCALE_MAX}" \
+    --max_user_len="${MAX_USER_LEN}" \
+    --max_item_len="${MAX_ITEM_LEN}" \
+    --sampled_negatives="${SAMPLED_NEGATIVES}" \
+    --negative_sampling_strategy="${NEGATIVE_SAMPLING_STRATEGY}" \
+    --negative_hard_topk="${NEGATIVE_HARD_TOPK}" \
+    --negative_hard_history_weight="${NEGATIVE_HARD_HISTORY_WEIGHT}" \
+    --negative_hard_max_token_df_ratio="${NEGATIVE_HARD_MAX_TOKEN_DF_RATIO}" \
+    --negative_hard_candidate_cap="${NEGATIVE_HARD_CANDIDATE_CAP}" \
+    --negative_hard_min_shared_tokens="${NEGATIVE_HARD_MIN_SHARED_TOKENS}" \
+    --negative_hard_log_stats="${NEGATIVE_HARD_LOG_STATS}" \
+    --negative_hard_log_every="${NEGATIVE_HARD_LOG_EVERY}" \
+    --negative_avoid_batch_positives="${NEGATIVE_AVOID_BATCH_POSITIVES}" \
+    --negative_dedup_per_query="${NEGATIVE_DEDUP_PER_QUERY}" \
+    --negative_max_trials="${NEGATIVE_MAX_TRIALS}" \
+    --latent_num_latents="${LATENT_NUM_LATENTS}" \
+    --latent_num_cross_heads="${LATENT_NUM_CROSS_HEADS}" \
+    --latent_cross_dim_head="${LATENT_CROSS_DIM_HEAD}" \
+    --latent_ff_mult="${LATENT_FF_MULT}" \
+    --user_suffix="${USER_SUFFIX}" \
+    --item_suffix="${ITEM_SUFFIX}" \
+    --eval_steps="${EVAL_STEPS}" \
+    --save_steps="${SAVE_STEPS}" \
+    --save_total_limit="${SAVE_TOTAL_LIMIT}" \
+    --early_stopping_patience="${EARLY_STOPPING_PATIENCE}" \
+    --logging_steps="${LOGGING_STEPS}" \
+    --bf16="${BF16}" \
+    --report_to="${REPORT_TO}" \
+    "${resume_args[@]}"

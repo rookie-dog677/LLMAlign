@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${SCRIPT_DIR}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+
+if [ ! -x "${PYTHON_BIN}" ]; then
+    PYTHON_BIN="$(command -v python3 || command -v python)"
+fi
+
+map_to_raw_dataset() {
+    case "$1" in
+        Games_5core|Video_Games) printf '%s' "Video_Games" ;;
+        Arts_5core|Arts_Crafts_and_Sewing) printf '%s' "Arts_Crafts_and_Sewing" ;;
+        Baby_5core|Baby_Products) printf '%s' "Baby_Products" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+map_to_downstream_dataset() {
+    case "$1" in
+        Video_Games|Games_5core) printf '%s' "Games_5core" ;;
+        Arts_Crafts_and_Sewing|Arts_5core) printf '%s' "Arts_5core" ;;
+        Baby_Products|Baby_5core) printf '%s' "Baby_5core" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+default_stage2_max_steps() {
+    case "$1" in
+        Games_5core|Video_Games|Arts_5core|Arts_Crafts_and_Sewing) printf '%s' "500" ;;
+        Baby_5core|Baby_Products) printf '%s' "250" ;;
+        *) printf '%s' "500" ;;
+    esac
+}
+
+normalize_pair_mining_mode() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        cooccurrence|global|global_cooccurrence)
+            printf '%s' "global"
+            ;;
+        sliding_window|sliding_window_cooccurrence|window)
+            printf '%s' "sliding_window"
+            ;;
+        *)
+            echo "Unsupported PAIR_MINING_MODE: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+pair_mode_tag() {
+    local pair_mining_mode="$1"
+    local window_size="${2:-}"
+    if [ "${pair_mining_mode}" = "sliding_window" ]; then
+        printf 'sw%s' "${window_size}"
+        return 0
+    fi
+    printf '%s' "global"
+}
+
+normalize_cooccurrence_head_init() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        semantic|semantic_head|cpa|cpa_head|latent_attention_head)
+            printf '%s' "semantic"
+            ;;
+        random|rand|scratch)
+            printf '%s' "random"
+            ;;
+        *)
+            echo "Unsupported COOCCURRENCE_HEAD_INIT: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+cooccurrence_head_init_tag() {
+    case "$1" in
+        semantic) printf '%s' "cpainit" ;;
+        random) printf '%s' "randinit" ;;
+        *)
+            echo "Unsupported normalized cooccurrence head init: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+find_dataset_csv() {
+    local raw_dataset="$1"
+    local split="$2"
+    local dataset_dir="${DATA_ROOT}/${raw_dataset}/5-core/${split}"
+    local csv_path=""
+
+    if [ ! -d "${dataset_dir}" ]; then
+        return 1
+    fi
+
+    csv_path="$(find "${dataset_dir}" -maxdepth 1 -type f -name "${raw_dataset}*.csv" ! -name '*.filtered_hard_overlap.csv' | sort | head -n 1)"
+    if [ -z "${csv_path}" ]; then
+        csv_path="$(find "${dataset_dir}" -maxdepth 1 -type f -name "${raw_dataset}*.csv" | sort | head -n 1)"
+    fi
+    if [ -z "${csv_path}" ]; then
+        return 1
+    fi
+    printf '%s' "${csv_path}"
+}
+
+resolve_single_token_anchor() {
+    local model_path="$1"
+    local detected_anchor=""
+    detected_anchor="$("${PYTHON_BIN}" - "${model_path}" <<'PY'
+import sys
+from transformers import AutoTokenizer
+
+model_path = sys.argv[1]
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    print(tokenizer.eos_token or "")
+except Exception:
+    print("")
+PY
+)"
+    case "${detected_anchor}" in
+        "<|endoftext|>"|"<|im_end|>")
+            printf '%s' "${detected_anchor}"
+            ;;
+        *)
+            printf '%s' "<|endoftext|>"
+            ;;
+    esac
+}
+
+find_latest_stage1_model() {
+    local raw_dataset="$1"
+    if [ ! -d "${REPO_ROOT}/output" ]; then
+        return 1
+    fi
+
+    while IFS= read -r candidate_dir; do
+        if [ -d "${candidate_dir}/best_checkpoint" ]; then
+            printf '%s' "${candidate_dir}/best_checkpoint"
+            return 0
+        fi
+        latest_checkpoint="$(find "${candidate_dir}" -maxdepth 1 -mindepth 1 -type d -name 'checkpoint-*' | sort -V | tail -n 1)"
+        if [ -n "${latest_checkpoint}" ] && [ -f "${latest_checkpoint}/model.safetensors" ] && [ -f "${latest_checkpoint}/latent_attention_head.pt" ]; then
+            printf '%s' "${latest_checkpoint}"
+            return 0
+        fi
+        if [ -f "${candidate_dir}/model.safetensors" ] && [ -f "${candidate_dir}/latent_attention_head.pt" ]; then
+            printf '%s' "${candidate_dir}"
+            return 0
+        fi
+    done < <(find "${REPO_ROOT}/output" -maxdepth 1 -mindepth 1 -type d -name "Qwen2-0.5B-CSFT-Contrastive-${raw_dataset}-qwen2-bidir-latent-hardoverlap*" | sort -r)
+
+    return 1
+}
+
+DATASET_INPUT="${LLMALIGN_DATASET:-${DATASET:-Games_5core}}"
+RAW_DATASET="$(map_to_raw_dataset "${DATASET_INPUT}")"
+DOWNSTREAM_DATASET="$(map_to_downstream_dataset "${DATASET_INPUT}")"
+DEFAULT_MAX_STEPS="$(default_stage2_max_steps "${DATASET_INPUT}")"
+BASE_MODEL="${BASE_MODEL:-${LLMALIGN_BASE_MODEL:-$(find_latest_stage1_model "${RAW_DATASET}" || true)}}"
+TRAIN_FILE="${TRAIN_FILE:-$(find_dataset_csv "${RAW_DATASET}" train)}"
+MAX_STEPS="${MAX_STEPS:-${DEFAULT_MAX_STEPS}}"
+PAIR_MINING_MODE_RAW="${PAIR_MINING_MODE:-${STAGE2_PAIR_MINING_MODE:-sliding_window}}"
+PAIR_MINING_MODE="$(normalize_pair_mining_mode "${PAIR_MINING_MODE_RAW}")"
+WINDOW_SIZE="${WINDOW_SIZE:-${SLIDING_WINDOW_SIZE:-3}}"
+if [ "${PAIR_MINING_MODE}" = "sliding_window" ]; then
+    if [ -z "${WINDOW_SIZE}" ] || [ "${WINDOW_SIZE}" -lt 2 ]; then
+        echo "WINDOW_SIZE must be >= 2 when PAIR_MINING_MODE=sliding_window. Current value: ${WINDOW_SIZE:-<empty>}" >&2
+        exit 1
+    fi
+fi
+if [[ -v COOCCURRENCE_HEAD_INIT && -n "${COOCCURRENCE_HEAD_INIT}" ]]; then
+    COOCCURRENCE_HEAD_INIT_SOURCE="env"
+else
+    COOCCURRENCE_HEAD_INIT_SOURCE="default"
+fi
+COOCCURRENCE_HEAD_INIT="$(normalize_cooccurrence_head_init "${COOCCURRENCE_HEAD_INIT:-semantic}")"
+ALLOW_RANDOM_COOCCURRENCE_HEAD_INIT="${ALLOW_RANDOM_COOCCURRENCE_HEAD_INIT:-0}"
+if [ "${COOCCURRENCE_HEAD_INIT}" = "random" ] && [ "${ALLOW_RANDOM_COOCCURRENCE_HEAD_INIT}" != "1" ]; then
+    echo "[LLMAlign-TCL] ERROR: random co-occurrence head init is disabled by default." >&2
+    echo "[LLMAlign-TCL] ERROR: Set COOCCURRENCE_HEAD_INIT=random and ALLOW_RANDOM_COOCCURRENCE_HEAD_INIT=1 together for intentional ablations." >&2
+    echo "[LLMAlign-TCL] ERROR: Current source=${COOCCURRENCE_HEAD_INIT_SOURCE} value=${COOCCURRENCE_HEAD_INIT}" >&2
+    exit 1
+fi
+PAIR_MODE_TAG="$(pair_mode_tag "${PAIR_MINING_MODE}" "${WINDOW_SIZE}")"
+COOCCURRENCE_HEAD_INIT_TAG="$(cooccurrence_head_init_tag "${COOCCURRENCE_HEAD_INIT}")"
+RUN_TAG="${RUN_TAG:-stage2_tcl_${RAW_DATASET}_${PAIR_MODE_TAG}_mc3_ppmi_nohn_lr1e4_bs1024_ms${MAX_STEPS}_eval50_${COOCCURRENCE_HEAD_INIT_TAG}}"
+TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/output/${RUN_TAG}_${TIMESTAMP}}"
+CACHE_PATH="${CACHE_PATH:-${REPO_ROOT}/output/${RUN_TAG}_hidden_cache_${DOWNSTREAM_DATASET}.pt}"
+PAIRS_PATH="${PAIRS_PATH:-${REPO_ROOT}/output/${RUN_TAG}_pairs_${RAW_DATASET}_mc3_ppmi.pt}"
+
+CUDA_DEVICE="${CUDA_DEVICE:-0}"
+CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-32}"
+CACHE_DTYPE="${CACHE_DTYPE:-fp16}"
+CACHE_BF16="${CACHE_BF16:-1}"
+MIN_COUNT="${MIN_COUNT:-3}"
+EXPAND_BIDIRECTIONAL_PAIRS="${EXPAND_BIDIRECTIONAL_PAIRS:-1}"
+COMPUTE_PPMI="${COMPUTE_PPMI:-1}"
+PPMI_ALPHA="${PPMI_ALPHA:-0.75}"
+PAIR_SAMPLE="${PAIR_SAMPLE:--1}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1024}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1024}"
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
+LOGGING_STEPS="${LOGGING_STEPS:-20}"
+EVAL_STEPS="${EVAL_STEPS:-50}"
+SAVE_STEPS="${SAVE_STEPS:-0}"
+EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-0}"
+EVAL_RATIO="${EVAL_RATIO:-0.05}"
+MAX_EVAL_PAIRS="${MAX_EVAL_PAIRS:-50000}"
+TEMPERATURE="${TEMPERATURE:-0.05}"
+LEARNABLE_TEMPERATURE="${LEARNABLE_TEMPERATURE:-1}"
+LOGIT_SCALE_MAX="${LOGIT_SCALE_MAX:-100.0}"
+SAVE_ONLY_BEST="${SAVE_ONLY_BEST:-1}"
+NORMALIZE_EMBEDDINGS="${NORMALIZE_EMBEDDINGS:-1}"
+POSITIVE_SAMPLING_MODE="${POSITIVE_SAMPLING_MODE:-ppmi}"
+HARD_NEGATIVE_MODE="${HARD_NEGATIVE_MODE:-none}"
+HARD_NEGATIVE_TOPK="${HARD_NEGATIVE_TOPK:-20}"
+HARD_NEGATIVE_CHUNK_SIZE="${HARD_NEGATIVE_CHUNK_SIZE:-512}"
+HARD_NEGATIVE_BATCH_SIZE="${HARD_NEGATIVE_BATCH_SIZE:-512}"
+HARD_NEGATIVE_MIN_SIMILARITY="${HARD_NEGATIVE_MIN_SIMILARITY:--1.0}"
+FORWARD_CHUNK_SIZE="${FORWARD_CHUNK_SIZE:-0}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
+BF16="${BF16:-1}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+SEED="${SEED:-42}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+
+case "$(printf '%s' "${RUN_TAG}" | tr '[:upper:]' '[:lower:]')" in
+    *randinit*)
+        if [ "${COOCCURRENCE_HEAD_INIT}" != "random" ]; then
+            echo "[LLMAlign-TCL] ERROR: RUN_TAG=${RUN_TAG} implies randinit but cooccurrence_head_init=${COOCCURRENCE_HEAD_INIT}." >&2
+            exit 1
+        fi
+        ;;
+    *cpainit*)
+        if [ "${COOCCURRENCE_HEAD_INIT}" != "semantic" ]; then
+            echo "[LLMAlign-TCL] ERROR: RUN_TAG=${RUN_TAG} implies cpainit but cooccurrence_head_init=${COOCCURRENCE_HEAD_INIT}." >&2
+            exit 1
+        fi
+        ;;
+esac
+
+if [ -z "${BASE_MODEL}" ] || [ ! -d "${BASE_MODEL}" ]; then
+    echo "Stage2 TCL base model not found. Set BASE_MODEL explicitly or run Stage1 first. Current value: ${BASE_MODEL:-<empty>}" >&2
+    exit 1
+fi
+if [ ! -f "${TRAIN_FILE}" ]; then
+    echo "Train file not found: ${TRAIN_FILE}" >&2
+    exit 1
+fi
+
+mkdir -p "${REPO_ROOT}/output" "${REPO_ROOT}/logs"
+
+MODEL_ANCHOR_TOKEN="$(resolve_single_token_anchor "${BASE_MODEL}")"
+
+echo "[LLMAlign-TCL] downstream_dataset=${DOWNSTREAM_DATASET} raw_dataset=${RAW_DATASET}"
+echo "[LLMAlign-TCL] base_model=${BASE_MODEL}"
+echo "[LLMAlign-TCL] train_file=${TRAIN_FILE}"
+echo "[LLMAlign-TCL] output_dir=${OUT_DIR}"
+echo "[LLMAlign-TCL] hidden_cache=${CACHE_PATH}"
+echo "[LLMAlign-TCL] pairs_path=${PAIRS_PATH}"
+echo "[LLMAlign-TCL] max_steps=${MAX_STEPS} early_stopping_patience=${EARLY_STOPPING_PATIENCE} eval_steps=${EVAL_STEPS}"
+echo "[LLMAlign-TCL] pair_mining_mode=${PAIR_MINING_MODE} window_size=${WINDOW_SIZE:-none}"
+echo "[LLMAlign-TCL] positive_sampling_mode=${POSITIVE_SAMPLING_MODE} hard_negative_mode=${HARD_NEGATIVE_MODE}"
+echo "[LLMAlign-TCL] cooccurrence_head_init=${COOCCURRENCE_HEAD_INIT} source=${COOCCURRENCE_HEAD_INIT_SOURCE}"
+
+if [ ! -f "${CACHE_PATH}" ]; then
+    CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${PYTHON_BIN}" "${REPO_ROOT}/stage2/run_llmalign_tcl.py" cache_hidden \
+        --dataset "${DOWNSTREAM_DATASET}" \
+        --base_model "${BASE_MODEL}" \
+        --output_path "${CACHE_PATH}" \
+        --batch_size "${CACHE_BATCH_SIZE}" \
+        --item_suffix "${MODEL_ANCHOR_TOKEN}" \
+        --attention_mask_type bidirectional \
+        --cache_dtype "${CACHE_DTYPE}" \
+        --bf16 "${CACHE_BF16}"
+else
+    echo "[LLMAlign-TCL] reuse hidden cache: ${CACHE_PATH}"
+fi
+
+if [ ! -f "${PAIRS_PATH}" ]; then
+    "${PYTHON_BIN}" "${REPO_ROOT}/stage2/run_llmalign_tcl.py" mine_pairs \
+        --train_file "${TRAIN_FILE}" \
+        --output_path "${PAIRS_PATH}" \
+        --pair_mining_mode "${PAIR_MINING_MODE}" \
+        --window_size "${WINDOW_SIZE:-0}" \
+        --min_count "${MIN_COUNT}" \
+        --expand_bidirectional_pairs "${EXPAND_BIDIRECTIONAL_PAIRS}" \
+        --compute_ppmi "${COMPUTE_PPMI}" \
+        --ppmi_alpha "${PPMI_ALPHA}" \
+        --sample "${PAIR_SAMPLE}" \
+        --seed "${SEED}"
+else
+    echo "[LLMAlign-TCL] reuse pair cache: ${PAIRS_PATH}"
+fi
+
+resume_args=()
+if [ -n "${RESUME_FROM_CHECKPOINT}" ]; then
+    resume_args+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+fi
+
+exec env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${PYTHON_BIN}" "${REPO_ROOT}/stage2/run_llmalign_tcl.py" train \
+    --base_model "${BASE_MODEL}" \
+    --hidden_cache_path "${CACHE_PATH}" \
+    --pairs_path "${PAIRS_PATH}" \
+    --output_dir "${OUT_DIR}" \
+    --batch_size "${TRAIN_BATCH_SIZE}" \
+    --eval_batch_size "${EVAL_BATCH_SIZE}" \
+    --learning_rate "${LEARNING_RATE}" \
+    --weight_decay "${WEIGHT_DECAY}" \
+    --warmup_ratio "${WARMUP_RATIO}" \
+    --max_steps "${MAX_STEPS}" \
+    --logging_steps "${LOGGING_STEPS}" \
+    --eval_steps "${EVAL_STEPS}" \
+    --save_steps "${SAVE_STEPS}" \
+    --early_stopping_patience "${EARLY_STOPPING_PATIENCE}" \
+    --eval_ratio "${EVAL_RATIO}" \
+    --max_eval_pairs "${MAX_EVAL_PAIRS}" \
+    --temperature "${TEMPERATURE}" \
+    --learnable_temperature "${LEARNABLE_TEMPERATURE}" \
+    --logit_scale_max "${LOGIT_SCALE_MAX}" \
+    --save_only_best "${SAVE_ONLY_BEST}" \
+    --normalize_embeddings "${NORMALIZE_EMBEDDINGS}" \
+    --positive_sampling_mode "${POSITIVE_SAMPLING_MODE}" \
+    --hard_negative_mode "${HARD_NEGATIVE_MODE}" \
+    --hard_negative_topk "${HARD_NEGATIVE_TOPK}" \
+    --hard_negative_chunk_size "${HARD_NEGATIVE_CHUNK_SIZE}" \
+    --hard_negative_batch_size "${HARD_NEGATIVE_BATCH_SIZE}" \
+    --hard_negative_min_similarity "${HARD_NEGATIVE_MIN_SIMILARITY}" \
+    --forward_chunk_size "${FORWARD_CHUNK_SIZE}" \
+    --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
+    --cooccurrence_head_init "${COOCCURRENCE_HEAD_INIT}" \
+    --bf16 "${BF16}" \
+    --max_grad_norm "${MAX_GRAD_NORM}" \
+    --seed "${SEED}" \
+    "${resume_args[@]}"
