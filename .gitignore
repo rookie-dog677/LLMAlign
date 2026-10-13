@@ -46,13 +46,3 @@ env/
 .env
 .env.*
 !.env.example
-
-# === Large data (provide separately) ===
-# Raw Amazon Review CSVs are License-restricted; users must download them
-# from https://amazon-reviews-2023.github.io/ themselves.
-data/
-data/**/*.csv
-data/**/raw/
-data/**/train/
-data/**/test/
-data/**/valid/

@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 ## Datasets
 
-The preprocessed datasets (`Games_5core`, `Arts_5core`, `Baby_5core` from Amazon Reviews 2023) can be downloaded from this [link](https://drive.google.com/file/d/1RxxEGCT3ZGGmYX0649XiwmObyiXq6L8S/view). Please unzip the files under directory `./data`.
+The preprocessed datasets (`Games_5core`, `Arts_5core`, `Baby_5core` from Amazon Reviews 2023) are included in the `./data` directory of this repository.
 
 ## Training
 
