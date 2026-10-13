@@ -1,8 +1,8 @@
-# LLMAlign: Making Large Language Models Effective Embedding Models for Sequential Recommendation
+# LLMAlign: Aligning LLM Embeddings with User Behavior for Sequential Recommendation
 
 ## Introduction
 
-This is the implementation of the submission "LLMAlign: Making Large Language Models Effective Embedding Models for Sequential Recommendation".
+This is the implementation of the submission "LLMAlign: Aligning LLM Embeddings with User Behavior for Sequential Recommendation".
 
 ## Environments
 
@@ -27,7 +27,7 @@ LLMAlign follows a two-stage training pipeline. Download a local copy of the bac
 # Stage 1: Contrastive Preference Alignment
 BASE_MODEL=/path/to/local/Qwen2-0.5B LLMALIGN_DATASET=Games_5core bash run_LLMAlign_CPA
 
-# Stage 2: Temporal/Co-occurrence Contrastive Learning
+# Stage 2: Transition-based Contrastive Learning
 LLMALIGN_DATASET=Games_5core bash run_LLMAlign_TCL
 ```
 
